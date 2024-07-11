@@ -59,6 +59,8 @@ static const char *const ssa_event_format =
 
 #define ASS_STYLES_ALLOC 20
 
+#define ASS_CACHE_MIN_TS(CACHE_TS, NEW_TS) CACHE_TS = FFMIN(CACHE_TS, NEW_TS)
+
 int ass_library_version(void)
 {
     return LIBASS_VERSION;
@@ -190,12 +192,21 @@ static int test_and_set_read_order_bit(ASS_Track *track, int id)
 {
     if (resize_read_order_bitmap(track, id) < 0)
         return -1;
-    int index = id / 32;
-    uint32_t bit = 1u << (id % 32);
+    int index = id >> 5; //div32
+    uint32_t bit = 1u << (id & 0x1F); //mod32
     if (track->parser_priv->read_order_bitmap[index] & bit)
         return 1;
     track->parser_priv->read_order_bitmap[index] |= bit;
     return 0;
+}
+
+static void clear_read_order_bit(ASS_Track *track, int id)
+{
+    int index = id >> 5;
+    if (index < track->parser_priv->read_order_elems) {
+        uint32_t mask = ~(1u << (id & 0x1F));
+        track->parser_priv->read_order_bitmap[index] &= mask;
+    }
 }
 
 // ==============================================================================================
@@ -1015,8 +1026,11 @@ static int process_events_line(ASS_Track *track, char *str)
         event = track->events + eid;
 
         int ret = process_event_tail(track, event, str, 0);
-        if (!ret)
+        if (!ret) {
+            ASS_CACHE_MIN_TS(track->parser_priv->gc_next_undisplay_ts,
+                             event->Start + event->Duration);
             return 0;
+        }
         // If something went wrong, discard the useless Event
         ass_free_event(track, eid);
         track->n_events--;
@@ -1330,7 +1344,8 @@ void ass_process_chunk(ASS_Track *track, const char *data, int size,
 
         event->Start = timecode;
         event->Duration = duration;
-
+        ASS_CACHE_MIN_TS(track->parser_priv->gc_next_undisplay_ts,
+                         event->Start + event->Duration);
         goto cleanup;
 //              dump_events(tid);
     } while (0);
@@ -1357,6 +1372,52 @@ void ass_flush_events(ASS_Track *track)
     free(track->parser_priv->read_order_bitmap);
     track->parser_priv->read_order_bitmap = NULL;
     track->parser_priv->read_order_elems = 0;
+}
+
+void ass_configure_gc(ASS_Track *track, int enabled, long long delay)
+{
+    track->parser_priv->gc_enabled = enabled;
+
+    if (0ll <= delay && enabled)
+        track->parser_priv->gc_delay = delay;
+}
+
+void ass_prune_events(ASS_Track *track, long long deadline)
+{
+    if (deadline < track->parser_priv->gc_next_undisplay_ts)
+        return;
+
+    const bool check_readorder = track->parser_priv->check_readorder;
+    const int old_n_events = track->n_events;
+
+    ASS_Event *events = track->events;
+
+    long long min_undisplay_remaining = LLONG_MAX;
+    int n_kept = 0;
+
+    for (int k = 0; k < old_n_events;) {
+        // discardable sequence
+        for (; k < old_n_events && events[k].Start + events[k].Duration < deadline; k++) {
+            if (check_readorder)
+                clear_read_order_bit(track, events[k].ReadOrder);
+            ass_free_event(track, k);
+        }
+
+        // to-be-kept sequence
+        int move_from = k;
+        for (; k < old_n_events && events[k].Start + events[k].Duration >= deadline; k++)
+            ASS_CACHE_MIN_TS(min_undisplay_remaining, events[k].Start + events[k].Duration);
+
+        // Relocate kept events
+        if (move_from < k) {
+            int cnt = k - move_from;
+            memmove(events + n_kept, events + move_from, cnt * sizeof(*track->events));
+            n_kept += cnt;
+        }
+    }
+
+    track->n_events = n_kept;
+    track->parser_priv->gc_next_undisplay_ts = min_undisplay_remaining;
 }
 
 #ifdef CONFIG_ICONV
@@ -1725,6 +1786,9 @@ ASS_Track *ass_new_track(ASS_Library *library)
     if (!track->styles[def_sid].Name || !track->styles[def_sid].FontName)
         goto fail;
     track->parser_priv->check_readorder = 1;
+    track->parser_priv->gc_enabled = 0;
+    track->parser_priv->gc_delay = 0;
+    track->parser_priv->gc_next_undisplay_ts = LLONG_MAX;
     return track;
 
 fail:

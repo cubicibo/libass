@@ -65,6 +65,10 @@ struct parser_priv {
     uint32_t header_flags;
 
     uint32_t feature_flags;
+
+    int gc_enabled;
+    long long gc_delay;
+    long long gc_next_undisplay_ts;
 };
 
 #endif /* LIBASS_PRIV_H */
